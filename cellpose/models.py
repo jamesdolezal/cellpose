@@ -1,6 +1,8 @@
+import threading
 import os, sys, time, shutil, tempfile, datetime, pathlib, subprocess
 from pathlib import Path
 import numpy as np
+from queue import Queue
 from tqdm import trange, tqdm
 from urllib.parse import urlparse
 import torch
@@ -577,7 +579,7 @@ class CellposeModel(UnetModel):
                 cellprob_threshold=0.0,
                 flow_threshold=0.4, min_size=15,
                 interp=True, anisotropy=1.0, do_3D=False, stitch_threshold=0.0,
-                ):
+                threaded=True):
 
         tic = time.time()
         shape = x.shape
@@ -607,26 +609,62 @@ class CellposeModel(UnetModel):
                 dP = np.zeros((2, nimg, int(shape[1]*rescale), int(shape[2]*rescale)), np.float32)
                 cellprob = np.zeros((nimg, int(shape[1]*rescale), int(shape[2]*rescale)), np.float32)
 
-            for i in iterator:
-                img = np.asarray(x[i])
+            # --- Asynchronous threading optimization -------------------------
+            if nimg > 1 and threaded:
                 if normalize or invert:
-                    img = transforms.normalize_img(img, invert=invert)
+                    x = [transforms.normalize_img(_x, invert=invert) for _x in x]
                 if rescale != 1.0:
-                    img = transforms.resize_image(img, rsz=rescale)
-                yf, style = self._run_nets(img, net_avg=net_avg,
-                                           augment=augment, tile=tile,
-                                           tile_overlap=tile_overlap)
-                if resample:
-                    yf = transforms.resize_image(yf, shape[1], shape[2])
+                    x = [transforms.resize_image(_x, rsz=rescale) for _x in x]
 
-                cellprob[i] = yf[:,:,2]
-                dP[:, i] = yf[:,:,:2].transpose((2,0,1))
-                if self.nclasses == 4:
-                    if i==0:
-                        bd = np.zeros_like(cellprob)
-                    bd[i] = yf[:,:,3]
-                styles[i] = style
-            del yf, style
+                queue = Queue(4)
+
+                def processor():
+                    while True:
+                        i, (yf, style) = queue.get()
+                        if yf is None:
+                            break
+                        if resample:
+                            yf = transforms.resize_image(yf, shape[1], shape[2])
+                        cellprob[i] = yf[:, :, 2]
+                        dP[:, i] = yf[:, :, :2].transpose((2, 0, 1))
+                        if self.nclasses == 4:
+                            if i == 0:
+                                bd = np.zeros_like(cellprob)
+                            bd[i] = yf[:, :, 3]
+                        styles[i] = style
+
+                thread = threading.Thread(target=processor)
+                thread.start()
+
+                for i in iterator:
+                    img = np.asarray(x[i])
+                    queue.put((i, self._run_nets(img, net_avg=net_avg,
+                                                augment=augment, tile=tile,
+                                                tile_overlap=tile_overlap)))
+                queue.put((None, (None, None)))
+                thread.join()
+            # -----------------------------------------------------------------
+            else:
+                for i in iterator:
+                    img = np.asarray(x[i])
+                    if normalize or invert:
+                        img = transforms.normalize_img(img, invert=invert)
+                    if rescale != 1.0:
+                        img = transforms.resize_image(img, rsz=rescale)
+                    yf, style = self._run_nets(img, net_avg=net_avg,
+                                            augment=augment, tile=tile,
+                                            tile_overlap=tile_overlap)
+                    if resample:
+                        yf = transforms.resize_image(yf, shape[1], shape[2])
+
+                    cellprob[i] = yf[:,:,2]
+                    dP[:, i] = yf[:,:,:2].transpose((2,0,1))
+                    if self.nclasses == 4:
+                        if i==0:
+                            bd = np.zeros_like(cellprob)
+                        bd[i] = yf[:,:,3]
+                    styles[i] = style
+                del yf, style
         styles = styles.squeeze()
 
 
